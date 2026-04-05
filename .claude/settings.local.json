@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(g++ -o project project.cpp)",
+      "Bash(./project)",
+      "Bash(g++:*)",
+      "Bash(git:*)"
+    ]
+  }
+}
