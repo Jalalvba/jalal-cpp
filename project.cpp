@@ -1,4 +1,5 @@
 #include <iostream>
+#include <iomanip>      // std::setw, std::left, std::right
 #include <cstdint>      // uintptr_t
 #include <cstring>      // memset
 #include <string>
@@ -7,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <cassert>
+#include <algorithm>    // std::remove_if
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: print the raw hex bytes of an object so you can see exact RAM layout
@@ -711,6 +713,495 @@ void section7() {
     }
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// SECTION 8 — Compiler Pipeline Simulation
+//
+// When you run:   g++ -std=c++17 -o project project.cpp
+// the compiler (GCC/Clang) executes these stages in order:
+//
+//   Source text
+//       │
+//   [1] Preprocessor  — expands #include / #define / #ifdef
+//       │
+//   [2] Lexer          — converts characters → stream of tokens
+//       │
+//   [3] Parser         — tokens → Abstract Syntax Tree (AST)
+//       │
+//   [4] Semantic       — type-check, name resolution, build symbol table
+//   Analysis
+//       │
+//   [5] IR Generation  — AST → platform-independent Intermediate Representation
+//       │
+//   [6] Optimiser      — constant folding, dead-code elimination, inlining, …
+//       │
+//   [7] Code Gen       — IR → target machine instructions (x86-64 asm here)
+//       │
+//   [8] Assembler       — text asm → relocatable object file (.o)
+//       │
+//   [9] Linker          — combine .o files + libraries → executable
+//
+// This section runs a tiny self-contained pipeline on the expression:
+//
+//     int result = 2 + 3 * 4;
+//
+// and prints every data structure the compiler builds along the way.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ─── Stage 1 helper: Preprocessor ───────────────────────────────────────────
+// Real work: resolve #include, substitute #define macros, strip comments.
+// Here we just demonstrate macro substitution on a source string.
+static std::string stage1_preprocess(const std::string& src) {
+    // Substitute a simple #define MAX_VAL 42 so the demo shows textual replacement.
+    std::string out = src;
+    const std::string macro_name  = "MAX_VAL";
+    const std::string macro_value = "42";
+    std::size_t pos = 0;
+    while ((pos = out.find(macro_name, pos)) != std::string::npos) {
+        out.replace(pos, macro_name.size(), macro_value);
+        pos += macro_value.size();
+    }
+    return out;
+}
+
+// ─── Stage 2: Lexer ──────────────────────────────────────────────────────────
+// The lexer (tokeniser) scans characters left-to-right and groups them into
+// tokens.  Each token has a kind and the original text.
+enum class TokenKind {
+    KW_INT,     // "int"
+    IDENT,      // identifier: "result"
+    NUMBER,     // integer literal: "2", "3", "4"
+    PLUS,       // '+'
+    STAR,       // '*'
+    EQUALS,     // '='
+    SEMICOLON,  // ';'
+    END,        // end of input
+};
+
+static const char* token_kind_name(TokenKind k) {
+    switch (k) {
+        case TokenKind::KW_INT:    return "KW_INT";
+        case TokenKind::IDENT:     return "IDENT";
+        case TokenKind::NUMBER:    return "NUMBER";
+        case TokenKind::PLUS:      return "PLUS";
+        case TokenKind::STAR:      return "STAR";
+        case TokenKind::EQUALS:    return "EQUALS";
+        case TokenKind::SEMICOLON: return "SEMICOLON";
+        case TokenKind::END:       return "END";
+    }
+    return "?";
+}
+
+struct Token {
+    TokenKind   kind;
+    std::string text;
+    int         col;    // column in source (1-based)
+};
+
+static std::vector<Token> stage2_lex(const std::string& src) {
+    std::vector<Token> tokens;
+    std::size_t i = 0;
+    while (i < src.size()) {
+        // skip whitespace
+        if (std::isspace((unsigned char)src[i])) { ++i; continue; }
+
+        int col = (int)i + 1;
+        // number
+        if (std::isdigit((unsigned char)src[i])) {
+            std::string num;
+            while (i < src.size() && std::isdigit((unsigned char)src[i]))
+                num += src[i++];
+            tokens.push_back({TokenKind::NUMBER, num, col});
+            continue;
+        }
+        // keyword or identifier
+        if (std::isalpha((unsigned char)src[i]) || src[i] == '_') {
+            std::string word;
+            while (i < src.size() && (std::isalnum((unsigned char)src[i]) || src[i] == '_'))
+                word += src[i++];
+            TokenKind k = (word == "int") ? TokenKind::KW_INT : TokenKind::IDENT;
+            tokens.push_back({k, word, col});
+            continue;
+        }
+        // single-char tokens
+        TokenKind k;
+        switch (src[i]) {
+            case '+': k = TokenKind::PLUS;      break;
+            case '*': k = TokenKind::STAR;      break;
+            case '=': k = TokenKind::EQUALS;    break;
+            case ';': k = TokenKind::SEMICOLON; break;
+            default:  ++i; continue;  // unknown char, skip
+        }
+        tokens.push_back({k, std::string(1, src[i]), col});
+        ++i;
+    }
+    tokens.push_back({TokenKind::END, "", (int)src.size() + 1});
+    return tokens;
+}
+
+// ─── Stage 3: Parser — builds an AST ─────────────────────────────────────────
+// Grammar (tiny subset):
+//   stmt   := "int" IDENT "=" expr ";"
+//   expr   := term  ("+" term)*          ← left-assoc addition
+//   term   := factor ("*" factor)*       ← left-assoc multiplication
+//   factor := NUMBER
+//
+// Operator precedence is handled by nesting: expr calls term, term calls factor.
+
+enum class ASTKind { IntDecl, BinOp, Literal, Var };
+
+struct ASTNode {
+    ASTKind     kind;
+    std::string text;        // literal value or operator or variable name
+    std::unique_ptr<ASTNode> left, right; // children for BinOp / IntDecl
+    int depth = 0;           // for pretty-printing
+};
+
+// Recursive-descent parser — each function consumes tokens from 'pos'
+static std::unique_ptr<ASTNode> parse_factor(const std::vector<Token>& toks, std::size_t& pos);
+static std::unique_ptr<ASTNode> parse_term  (const std::vector<Token>& toks, std::size_t& pos);
+static std::unique_ptr<ASTNode> parse_expr  (const std::vector<Token>& toks, std::size_t& pos);
+
+static std::unique_ptr<ASTNode> parse_factor(const std::vector<Token>& toks, std::size_t& pos) {
+    auto node = std::make_unique<ASTNode>();
+    node->kind = ASTKind::Literal;
+    node->text = toks[pos].text;   // the number
+    ++pos;
+    return node;
+}
+
+static std::unique_ptr<ASTNode> parse_term(const std::vector<Token>& toks, std::size_t& pos) {
+    auto node = parse_factor(toks, pos);
+    while (pos < toks.size() && toks[pos].kind == TokenKind::STAR) {
+        ++pos; // consume '*'
+        auto bin = std::make_unique<ASTNode>();
+        bin->kind  = ASTKind::BinOp;
+        bin->text  = "*";
+        bin->left  = std::move(node);
+        bin->right = parse_factor(toks, pos);
+        node = std::move(bin);
+    }
+    return node;
+}
+
+static std::unique_ptr<ASTNode> parse_expr(const std::vector<Token>& toks, std::size_t& pos) {
+    auto node = parse_term(toks, pos);
+    while (pos < toks.size() && toks[pos].kind == TokenKind::PLUS) {
+        ++pos; // consume '+'
+        auto bin = std::make_unique<ASTNode>();
+        bin->kind  = ASTKind::BinOp;
+        bin->text  = "+";
+        bin->left  = std::move(node);
+        bin->right = parse_term(toks, pos);
+        node = std::move(bin);
+    }
+    return node;
+}
+
+static std::unique_ptr<ASTNode> stage3_parse(const std::vector<Token>& toks) {
+    // Expect:  KW_INT  IDENT  EQUALS  <expr>  SEMICOLON
+    std::size_t pos = 0;
+    auto decl       = std::make_unique<ASTNode>();
+    decl->kind      = ASTKind::IntDecl;
+    decl->text      = "int_decl";
+
+    ++pos; // KW_INT
+    auto var        = std::make_unique<ASTNode>();
+    var->kind       = ASTKind::Var;
+    var->text       = toks[pos].text;   // "result"
+    ++pos;  // IDENT
+    ++pos;  // EQUALS
+
+    decl->left  = std::move(var);
+    decl->right = parse_expr(toks, pos);
+    // pos now points at SEMICOLON — skip it
+    return decl;
+}
+
+// Pretty-print AST with indentation
+static void print_ast(const ASTNode* n, int depth = 0) {
+    if (!n) return;
+    std::string indent(depth * 4, ' ');
+    switch (n->kind) {
+        case ASTKind::IntDecl: std::cout << indent << "IntDecl\n"; break;
+        case ASTKind::BinOp:   std::cout << indent << "BinOp(" << n->text << ")\n"; break;
+        case ASTKind::Literal: std::cout << indent << "Literal(" << n->text << ")\n"; break;
+        case ASTKind::Var:     std::cout << indent << "Var(" << n->text << ")\n"; break;
+    }
+    print_ast(n->left.get(),  depth + 1);
+    print_ast(n->right.get(), depth + 1);
+}
+
+// ─── Stage 4: Semantic Analysis ──────────────────────────────────────────────
+// Walks the AST:
+//  - checks every Literal is a valid integer
+//  - records the declared variable in a symbol table
+//  - computes and annotates each node's type (always "int" here)
+struct Symbol {
+    std::string name;
+    std::string type;
+    int         stack_offset; // byte offset from frame pointer (simulated)
+};
+
+static std::vector<Symbol> symbol_table;
+
+static std::string stage4_analyse(const ASTNode* n, int frame_offset = 0) {
+    if (!n) return "";
+    switch (n->kind) {
+        case ASTKind::IntDecl: {
+            std::string var_name = n->left ? n->left->text : "?";
+            symbol_table.push_back({var_name, "int", frame_offset});
+            stage4_analyse(n->right.get(), frame_offset);
+            return "int";
+        }
+        case ASTKind::BinOp: {
+            std::string lt = stage4_analyse(n->left.get(),  frame_offset);
+            std::string rt = stage4_analyse(n->right.get(), frame_offset);
+            if (lt != rt) {
+                std::cout << "    [Semantic ERROR] type mismatch: "
+                          << lt << " " << n->text << " " << rt << "\n";
+            }
+            return lt; // both are "int"
+        }
+        case ASTKind::Literal:
+            return "int";
+        case ASTKind::Var:
+            return "int";
+    }
+    return "";
+}
+
+// ─── Stage 5+6: IR Generation + Constant Folding ────────────────────────────
+// We use a three-address code (TAC) IR, the kind Clang/GCC use internally.
+// Each instruction is:   result = left  op  right
+// or                     result = immediate
+//
+// Constant folding (optimisation) evaluates expressions with all-constant
+// operands at compile time, eliminating the runtime computation entirely.
+
+struct IRInstr {
+    std::string result;  // destination temp, e.g. "%t0"
+    std::string op;      // "+", "*", "=", "const"
+    std::string left;
+    std::string right;
+};
+
+static std::vector<IRInstr> ir_code;
+static int temp_counter = 0;
+
+static std::string new_temp() {
+    return "%t" + std::to_string(temp_counter++);
+}
+
+// Returns the temp that holds the value of 'n' after emitting IR.
+static std::string stage5_emit(const ASTNode* n) {
+    if (!n) return "";
+    switch (n->kind) {
+        case ASTKind::Literal: {
+            std::string t = new_temp();
+            ir_code.push_back({t, "const", n->text, ""});
+            return t;
+        }
+        case ASTKind::BinOp: {
+            std::string l = stage5_emit(n->left.get());
+            std::string r = stage5_emit(n->right.get());
+            // ── Constant folding (optimiser pass) ────────────────────────
+            // If both operands are compile-time constants we can fold them now.
+            // Returns the integer value of a temp if it was emitted as a const
+            // (either "const" or "const_folded").  Returns false if not found.
+            auto find_const = [](const std::string& tmp, int& out) -> bool {
+                for (const auto& ins : ir_code)
+                    if (ins.result == tmp &&
+                        (ins.op == "const" || ins.op == "const_folded")) {
+                        out = std::stoi(ins.left);
+                        return true;
+                    }
+                return false;
+            };
+            int lval = 0, rval = 0;
+            bool lv = find_const(l, lval);
+            bool rv = find_const(r, rval);
+            if (lv && rv) {
+                int folded = (n->text == "+") ? (lval + rval) : (lval * rval);
+                std::string t = new_temp();
+                // Remove the two const instructions (they are now dead)
+                ir_code.erase(
+                    std::remove_if(ir_code.begin(), ir_code.end(),
+                        [&](const IRInstr& ins){
+                            return ins.result == l || ins.result == r;
+                        }),
+                    ir_code.end());
+                ir_code.push_back(IRInstr{t, "const_folded",
+                                   std::to_string(folded),
+                                   "(" + std::to_string(lval) + n->text + std::to_string(rval) + ")"});
+                return t;
+            }
+            std::string t = new_temp();
+            ir_code.push_back({t, n->text, l, r});
+            return t;
+        }
+        case ASTKind::IntDecl: {
+            std::string rhs = stage5_emit(n->right.get());
+            std::string var = n->left ? n->left->text : "?";
+            ir_code.push_back({var, "=", rhs, ""});
+            return var;
+        }
+        default: return "";
+    }
+}
+
+// ─── Stage 7: Code Generation (x86-64 assembly) ──────────────────────────────
+// Translates each IR instruction to an x86-64 assembly mnemonic.
+// Registers used: rax (accumulator), rbx (scratch), [rbp-4] (local variable).
+static void stage7_codegen() {
+    std::cout << "  x86-64 assembly output (AT&T syntax):\n";
+    std::cout << "  ┌─────────────────────────────────────────────────────┐\n";
+
+    for (const auto& ins : ir_code) {
+        if (ins.op == "const") {
+            std::cout << "  │  movl   $" << ins.left
+                      << ", " << ins.result
+                      << "         # " << ins.result << " = " << ins.left << "\n";
+        } else if (ins.op == "const_folded") {
+            // After constant folding the whole expression is one immediate.
+            std::cout << "  │  movl   $" << ins.left
+                      << ", %eax              # const-folded: " << ins.right << " = " << ins.left << "\n";
+        } else if (ins.op == "+") {
+            std::cout << "  │  movl   " << ins.left  << ", %eax\n";
+            std::cout << "  │  addl   " << ins.right << ", %eax         # " << ins.result << " = " << ins.left << " + " << ins.right << "\n";
+        } else if (ins.op == "*") {
+            std::cout << "  │  movl   " << ins.left  << ", %eax\n";
+            std::cout << "  │  imull  " << ins.right << ", %eax         # " << ins.result << " = " << ins.left << " * " << ins.right << "\n";
+        } else if (ins.op == "=") {
+            // If the RHS temp was the most-recently computed value it is already
+            // in %eax (register allocation trivially avoids the redundant move).
+            bool already_in_eax = (!ir_code.empty() &&
+                &ins != &ir_code.front() &&
+                (&ins - 1)->result == ins.left);
+            if (!already_in_eax)
+                std::cout << "  │  movl   " << ins.left << ", %eax\n";
+            std::cout << "  │  movl   %eax, -4(%rbp)       # store '" << ins.result << "' to stack\n";
+        }
+    }
+    std::cout << "  └─────────────────────────────────────────────────────┘\n";
+}
+
+// ─── section8: run the full pipeline ─────────────────────────────────────────
+void section8() {
+    std::cout << "\n══════════════════════════════════════════════\n";
+    std::cout << "SECTION 8 — Compiler Pipeline Simulation\n";
+    std::cout << "══════════════════════════════════════════════\n";
+
+    // ── Input source ─────────────────────────────────────────────────────────
+    // We intentionally include a macro so the preprocessor stage has work to do.
+    const std::string raw_source = "int result = 2 + 3 * 4;";
+    std::cout << "\n  Input source:  \"" << raw_source << "\"\n";
+
+    // ══ Stage 1: Preprocessor ════════════════════════════════════════════════
+    std::cout << "\n── Stage 1: Preprocessor ──\n";
+    std::cout << "  (No macros in this snippet — output identical to input)\n";
+    std::string preprocessed = stage1_preprocess(raw_source);
+    std::cout << "  After preprocessing: \"" << preprocessed << "\"\n";
+
+    // Show macro substitution on a separate example
+    const std::string macro_example = "int limit = MAX_VAL;";
+    std::cout << "\n  Macro demo — before: \"" << macro_example << "\"\n";
+    std::cout << "               after:  \"" << stage1_preprocess(macro_example) << "\"\n";
+    std::cout << "  What the preprocessor does in RAM:\n";
+    std::cout << "    Reads source bytes into a char buffer.\n";
+    std::cout << "    Scans for '#define' directives and builds a macro table.\n";
+    std::cout << "    Replaces each macro name with its token-sequence value.\n";
+    std::cout << "    Outputs a new char buffer — no AST yet, purely textual.\n";
+
+    // ══ Stage 2: Lexer ════════════════════════════════════════════════════════
+    std::cout << "\n── Stage 2: Lexer (Tokeniser) ──\n";
+    std::cout << "  Input string → stream of tokens (each has kind + text + column)\n";
+    auto tokens = stage2_lex(preprocessed);
+    for (const auto& tok : tokens) {
+        if (tok.kind == TokenKind::END) break;
+        std::cout << "    col " << std::setw(2) << tok.col
+                  << "  " << std::setw(10) << std::left << token_kind_name(tok.kind)
+                  << "  \"" << tok.text << "\"\n";
+    }
+    std::cout << std::right;
+    std::cout << "  In memory: vector of Token structs, each ~48 bytes (kind + string + int)\n";
+    std::cout << "  sizeof(Token) = " << sizeof(Token) << " bytes"
+              << "  |  " << tokens.size() << " tokens total\n";
+
+    // ══ Stage 3: Parser → AST ════════════════════════════════════════════════
+    std::cout << "\n── Stage 3: Parser (builds Abstract Syntax Tree) ──\n";
+    std::cout << "  Recursive-descent: parse_expr → parse_term → parse_factor\n";
+    std::cout << "  * precedence is encoded in the call depth, not a table\n\n";
+    auto ast = stage3_parse(tokens);
+    std::cout << "  AST for \"" << preprocessed << "\":\n";
+    print_ast(ast.get());
+    std::cout << "\n  Each ASTNode is heap-allocated (std::unique_ptr).\n";
+    std::cout << "  sizeof(ASTNode) = " << sizeof(ASTNode) << " bytes"
+              << "  (kind + text + 2 unique_ptrs + depth)\n";
+    // Show actual pointers so the memory layout is visible
+    std::cout << "  IntDecl node @ " << (void*)ast.get() << "\n";
+    if (ast->left)  std::cout << "  Var node     @ " << (void*)ast->left.get()  << "\n";
+    if (ast->right) std::cout << "  BinOp(+) node@ " << (void*)ast->right.get() << "\n";
+
+    // ══ Stage 4: Semantic Analysis ═══════════════════════════════════════════
+    std::cout << "\n── Stage 4: Semantic Analysis ──\n";
+    std::cout << "  Walk AST, check types, build symbol table.\n";
+    symbol_table.clear();
+    std::string root_type = stage4_analyse(ast.get(), /*stack frame offset*/ -4);
+    std::cout << "  Root expression type: " << root_type << "\n";
+    std::cout << "  Symbol table:\n";
+    for (const auto& sym : symbol_table) {
+        std::cout << "    name=\"" << sym.name << "\""
+                  << "  type=" << sym.type
+                  << "  stack_offset=" << sym.stack_offset << "(%rbp)\n";
+    }
+
+    // ══ Stage 5+6: IR Generation + Constant Folding ══════════════════════════
+    std::cout << "\n── Stage 5: IR Generation  +  Stage 6: Constant Folding ──\n";
+    std::cout << "  Three-address code (TAC) — same form as LLVM IR / GCC GIMPLE:\n";
+    ir_code.clear();
+    temp_counter = 0;
+    stage5_emit(ast.get());
+
+    std::cout << "  IR instructions (after optimiser):\n";
+    for (const auto& ins : ir_code) {
+        if (ins.op == "const")
+            std::cout << "    " << ins.result << " = " << ins.left << "\n";
+        else if (ins.op == "const_folded")
+            std::cout << "    " << ins.result << " = " << ins.left
+                      << "   ; const-folded from " << ins.right << "\n";
+        else if (ins.op == "=")
+            std::cout << "    " << ins.result << " = " << ins.left << "\n";
+        else
+            std::cout << "    " << ins.result << " = "
+                      << ins.left << " " << ins.op << " " << ins.right << "\n";
+    }
+    std::cout << "  Constant folding eliminated the runtime '+' and '*':\n";
+    std::cout << "    2 + 3 * 4  →  2 + 12  →  14  (computed at compile time)\n";
+
+    // ══ Stage 7: Code Generation ══════════════════════════════════════════════
+    std::cout << "\n── Stage 7: Code Generation (x86-64) ──\n";
+    stage7_codegen();
+    std::cout << "  Key CPU concepts visible in the output:\n";
+    std::cout << "    movl  $14, %eax        — load immediate 14 into 32-bit register eax\n";
+    std::cout << "    movl  %eax, -4(%rbp)   — store to stack slot at [frame_pointer - 4]\n";
+    std::cout << "    Because of folding, zero arithmetic instructions are needed.\n";
+
+    // ══ Stages 8–9: Assembler & Linker (conceptual) ══════════════════════════
+    std::cout << "\n── Stages 8–9: Assembler + Linker (conceptual) ──\n";
+    std::cout << "  Assembler (as):\n";
+    std::cout << "    Reads the .s text above and writes an ELF .o (object file).\n";
+    std::cout << "    Each instruction becomes 1-15 bytes of machine code.\n";
+    std::cout << "    movl $14, %eax  →  b8 0e 00 00 00  (5 bytes: opcode + imm32)\n";
+    std::cout << "    movl %eax,-4(%rbp) → 89 45 fc       (3 bytes: opcode + ModRM + disp8)\n";
+    std::cout << "\n  Linker (ld / gold / lld):\n";
+    std::cout << "    Combines .o files, resolves symbol references (printf, malloc, …),\n";
+    std::cout << "    patches relocations, and writes the final ELF executable.\n";
+    std::cout << "    The OS loader then maps that ELF into virtual memory and calls main().\n";
+
+    std::cout << "\n  Full pipeline done for:  int result = 2 + 3 * 4;\n";
+    std::cout << "  Compile-time answer:     result = 14\n";
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 int main() {
     // std::hex integers: use noshowbase + manual "0x" for clean output,
@@ -723,6 +1214,7 @@ int main() {
     section5();
     section6();
     section7();
+    section8();
 
     std::cout << "\nDone.\n";
     return 0;

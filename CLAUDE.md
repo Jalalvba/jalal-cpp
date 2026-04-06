@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Run
 
 ```bash
-# Compile
+# Compile project.cpp (sections 1–7)
 g++ -std=c++17 -Wall -Wextra -o project project.cpp
 
 # Run (sections 1–6 run automatically; section 7 is interactive)
@@ -13,13 +13,21 @@ g++ -std=c++17 -Wall -Wextra -o project project.cpp
 
 # Run with piped input to drive the interactive section 7
 echo -e "btn\nclick\nquit" | ./project
+
+# Compile and run individual section files (sections 8–13)
+g++ -std=c++17 -Wall -Wextra -o s08 s08_heap_stack.cpp && ./s08
+g++ -std=c++17 -Wall -Wextra -o s09 s09_inheritance_vtable.cpp && ./s09
+g++ -std=c++17 -Wall -Wextra -o s10 s10_templates_handle.cpp && ./s10
+g++ -std=c++17 -Wall -Wextra -o s11 s11_smart_pointers.cpp && ./s11
+g++ -std=c++17 -Wall -Wextra -o s12 s12_compiler_pipeline.cpp && ./s12
+g++ -std=c++17 -Wall -Wextra -o s13 s13_chromium_convergence.cpp && ./s13
 ```
 
 ## Architecture
 
-Single-file C++ project (`project.cpp`) structured as self-contained numbered sections, each teaching one memory-layout or systems concept. All sections are called in sequence from `main()`.
+Each file is a self-contained, standalone C++ program teaching one competence needed to read Blink or V8 source code. Every section prints real addresses, real `sizeof` values, and real hex bytes — nothing hardcoded.
 
-### Section layout
+### project.cpp — sections 1–7 (CPU & memory fundamentals + Blink/V8 simulation)
 
 | Section | Topic |
 |---|---|
@@ -30,6 +38,17 @@ Single-file C++ project (`project.cpp`) structured as self-contained numbered se
 | 5 | Pointer to struct — `->` dereference, aliasing |
 | 6 | Reference to struct — reference as hidden pointer, same address |
 | 7 | **Blink + V8 pipeline simulation** — DOM tree, event dispatch, wrapper map |
+
+### Standalone section files — sections 8–13 (C++ competences for Chromium reading)
+
+| File | Section | Competence | Chromium connection |
+|---|---|---|---|
+| `s08_heap_stack.cpp` | 08 | Heap vs Stack — allocate on heap and stack, explain address difference | Blink DOM nodes live on heap — they outlive the function that creates them |
+| `s09_inheritance_vtable.cpp` | 09 | Inheritance + vtable — build class hierarchy, read vtable pointer at offset 0 | `BlinkNode` → `BlinkElement`, every DOM node's first 8 bytes are a vtable pointer |
+| `s10_templates_handle.cpp` | 10 | Templates + `Handle<T>` — write `Handle<T>` wrapping a raw pointer | V8's `Local<T>` is this pattern — prevents GC from moving objects |
+| `s11_smart_pointers.cpp` | 11 | Smart pointers — `unique_ptr`, `shared_ptr`, `use_count` | Blink's `scoped_refptr<T>` is a hand-rolled `shared_ptr` |
+| `s12_compiler_pipeline.cpp` | 12 | Compiler pipeline — trace `int x = 1+1` from source to x86-64 bytes | What `g++` does before any byte reaches the CPU |
+| `s13_chromium_convergence.cpp` | 13 | Chromium convergence — DOM tree with vtable + `Handle<T>` + ref counting + event dispatch | Complete Blink+V8 renderer pipeline in one file |
 
 ### Section 7 design (Blink + V8)
 
