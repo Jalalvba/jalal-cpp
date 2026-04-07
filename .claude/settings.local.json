@@ -4,7 +4,15 @@
       "Bash(g++ -o project project.cpp)",
       "Bash(./project)",
       "Bash(g++:*)",
-      "Bash(git:*)"
+      "Bash(git:*)",
+      "Bash(./s08)",
+      "Bash(./s09)",
+      "Bash(./s10)",
+      "Bash(./s11)",
+      "Bash(./s12)",
+      "Bash(./s13)",
+      "Bash(gh --version)",
+      "Bash(./out)"
     ]
   }
 }
