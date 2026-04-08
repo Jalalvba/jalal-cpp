@@ -12,7 +12,9 @@
       "Bash(./s12)",
       "Bash(./s13)",
       "Bash(gh --version)",
-      "Bash(./out)"
+      "Bash(./out)",
+      "Bash(./jalal)",
+      "Bash(pkg install:*)"
     ]
   }
 }
