@@ -61,6 +61,11 @@ T typed_max(const T& a, const T& b) {
 }
 
 
+template<typename T>
+T clamp(const T& v, const T& lo, const T& hi) {
+    return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
 // ── A plain struct to use as a template argument ──────────────────────────────
 struct Vec2 {
     float x, y;   // 4 + 4 = 8 bytes, no padding needed
